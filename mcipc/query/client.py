@@ -1,8 +1,10 @@
 """Query client library."""
 
-from socket import SOCK_DGRAM, socket
 from typing import Union
-from warnings import warn
+import asyncio 
+import io
+
+import asyncio_dgram
 
 from mcipc.query.proto import BasicStats
 from mcipc.query.proto import BasicStatsRequest
@@ -16,12 +18,11 @@ from mcipc.query.proto import Response
 __all__ = ['Client']
 
 
-WARN_TEMP = 'Client.{} is deprecated. Use Client.stats({}) instead.'
 Request = Union[BasicStatsRequest, FullStatsRequest]
-Response = Union[BasicStats, FullStats]
+_Response = Union[BasicStats, FullStats]
 
 
-def get_message_types(full: bool) -> tuple[Request, Response]:
+def get_message_types(full: bool) -> tuple[Request, _Response]:
     """Returns request and response types."""
 
     if full:
@@ -30,71 +31,62 @@ def get_message_types(full: bool) -> tuple[Request, Response]:
     return (BasicStatsRequest, BasicStats)
 
 
+class IsNotConnected(Exception):
+    pass
+
+
 class Client:
     """A basic client, common to Query and RCON."""
 
     def __init__(self, host: str, port: int, *, timeout: float = None):
         """Sets host an port."""
-        self._socket = socket(type=SOCK_DGRAM)
-        self.host = host
-        self.port = port
+        self.stream = None
+        self.addr = (host, port)
         self.timeout = timeout
         self.challenge_token = None
 
-    def connect(self):
+    async def connect(self):
         """Contects the socket."""
-        self._socket.__enter__()
-        self._socket.settimeout(self.timeout)
-        self._socket.connect((self.host, self.port))
+        self.stream = await asyncio_dgram.connect(self.addr)
+        print(self.stream)
 
         if self.challenge_token is None:
-            self.challenge_token = self.handshake()
+            self.challenge_token = await self.handshake()
 
-    def disconnect(self):
-        """Delegates to the underlying socket's exit method."""
-        return self._socket.__exit__()
+    async def disconnect(self):
+        return self.stream.close()
 
-    def __enter__(self):
-        """connect on entering a context"""
-        self.connect()
+    async def __aenter__(self):
+        await self.connect()
         return self
 
-    def __exit__(self, typ, value, traceback):
-        """Delegates to the underlying socket's exit method."""
-        return self._socket.__exit__(typ, value, traceback)
+    async def __aexit__(self, exc_type, exc, tb):
+        return await self.disconnect()
+    
+    async def send(self, message):
+        if self.stream is None:
+            raise IsNotConnected("is not connected.")
 
-    @property
-    def basic_stats(self) -> BasicStats:
-        """Returns basic stats."""
-        warn(WARN_TEMP.format('basic_stats', ''), FutureWarning, stacklevel=2)
-        return self.stats()
+        async def predicate():
+            await self.stream.send(bytes(message))
+            return await self.stream.recv()
 
-    @property
-    def full_stats(self) -> FullStats:
-        """Returns full stats."""
-        warn(WARN_TEMP.format('full_stats', 'full=True'), FutureWarning,
-             stacklevel=2)
-        return self.stats(full=True)
+        return await asyncio.wait_for(predicate(), timeout=self.timeout)
 
-    def handshake(self) -> BigEndianSignedInt32:
+    async def handshake(self) -> BigEndianSignedInt32:
         """Performs a handshake."""
         request = HandshakeRequest.create()
-
-        with self._socket.makefile('wb') as file:
-            file.write(bytes(request))
-
-        with self._socket.makefile('rb') as file:
-            response = Response.read(file)
+        data, _ = await self.send(request)
+        file = io.BytesIO(data)
+        response = Response.read(file)
 
         return response.challenge_token
 
-    def stats(self, full: bool = False) -> Union[BasicStats, FullStats]:
+    async def stats(self, full: bool = False) -> Union[BasicStats, FullStats]:
         """Returns basic or full stats."""
         request_type, return_type = get_message_types(full)
         request = request_type.create(self.challenge_token)
-
-        with self._socket.makefile('wb') as file:
-            file.write(bytes(request))
-
-        with self._socket.makefile('rb') as file:
-            return return_type.read(file)
+     
+        data, _ = await self.send(request)
+        file = io.BytesIO(data)
+        return return_type.read(file)
