@@ -48,7 +48,6 @@ class Client:
     async def connect(self):
         """Contects the socket."""
         self.stream = await asyncio_dgram.connect(self.addr)
-        print(self.stream)
 
         if self.challenge_token is None:
             self.challenge_token = await self.handshake()
